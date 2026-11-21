@@ -16,7 +16,8 @@ def save_checkpoint(output, model, optimizer, stream, mc, tc, state, rank, world
         directory.mkdir(parents=True, exist_ok=False)
     if world > 1: dist.barrier()
     temporary = directory/f'rank_{rank:04d}.pt.tmp'
-    torch.save({'optimizer':optimizer.state_dict(), 'rng':rng_state(), 'data':stream.state_dict(),
+    device = next(model.parameters()).device
+    torch.save({'optimizer':optimizer.state_dict(), 'rng':rng_state(device), 'data':stream.state_dict(),
                 'routing_rng':model.routing_rng_state()}, temporary)
     temporary.replace(directory/f'rank_{rank:04d}.pt')
     if rank == 0:
@@ -49,6 +50,6 @@ def load_checkpoint(path, model, optimizer=None, stream=None, rank=0, world=1):
         local = torch.load(path/f'rank_{rank:04d}.pt', map_location='cpu', weights_only=False)
         optimizer.load_state_dict(local['optimizer'])
         stream.load_state_dict(local['data'])
-        restore_rng(local['rng'])
+        restore_rng(local['rng'], next(model.parameters()).device)
         model.restore_routing_rng(local['routing_rng'])
     return saved

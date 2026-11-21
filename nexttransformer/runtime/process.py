@@ -64,14 +64,24 @@ def source_manifest():
     return {'commit':commit,'files':files,'sha256':hashlib.sha256(json.dumps(files,sort_keys=True).encode()).hexdigest()}
 
 
-def rng_state():
-    return {'python':random.getstate(),'numpy':np.random.get_state(),'torch':torch.get_rng_state(),
-            'cuda':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+def rng_state(device=None):
+    state = {'python':random.getstate(),'numpy':np.random.get_state(),'torch':torch.get_rng_state(),
+             'cuda':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+    if device is not None and device.type == 'npu':
+        state['npu'] = torch.npu.get_rng_state(device)
+    return state
 
 
-def restore_rng(state):
+def restore_rng(state, device=None):
+    npu = device is not None and device.type == 'npu'
+    if npu and 'npu' not in state:
+        raise ValueError('NPU resume requires NPU RNG state in the native checkpoint')
+    if not npu and 'npu' in state:
+        raise ValueError('NPU RNG checkpoint requires an NPU destination')
     random.setstate(state['python']); np.random.set_state(state['numpy']); torch.set_rng_state(state['torch'])
     if state['cuda'] is not None: torch.cuda.set_rng_state_all(state['cuda'])
+    if npu:
+        torch.npu.set_rng_state(state['npu'], device)
 
 
 def append_event(output, event):
