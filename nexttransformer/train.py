@@ -243,6 +243,9 @@ def parse(argv=None):
     parser.add_argument("--eval-batch", type=int, help="BPB rows per rank and call (default: --micro-batch)")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--smoke-steps", type=int, default=0, help="bounded test; never a formal result")
+    parser.add_argument("--npu", action="store_true", help="opt in to single-device Dense debug research smoke")
+    parser.add_argument("--smoke-stop-at", type=int, default=0,
+                        help="checkpoint and end this segment at an absolute update below --smoke-steps")
     parser.add_argument("--smoke-val-tokens", type=int, default=0, help="0: one distributed evaluation batch")
     parser.add_argument("--smoke-core-per-task", type=int, default=0,
                         help="smoke CORE examples per task at the last step (0: skip, -1: all; >=32 so "
@@ -271,6 +274,11 @@ def parse(argv=None):
     args.eval_batch = args.eval_batch or args.micro_batch
     if min(args.log_every, args.rolling_every) < 1 or args.rolling_keep < 0: parser.error("intervals must be positive")
     if args.smoke_accumulation and not args.smoke_steps: parser.error("--smoke-accumulation is smoke-only")
+    if args.smoke_stop_at and not 0 < args.smoke_stop_at < args.smoke_steps:
+        parser.error("--smoke-stop-at must be positive and below --smoke-steps")
+    if args.npu and (args.formal or args.smoke_steps <= 0 or args.speedups or args.deterministic_attention or
+                     args.smoke_core_per_task):
+        parser.error("--npu requires research smoke without speedups, CORE, or CUDA deterministic-attention options")
     return args
 
 
@@ -304,7 +312,15 @@ def main(argv=None):
             if args.wandb_fallback == "fail": raise
             wandb_note = f"online W&B unavailable ({exc}); offline mirror, sync later"
             args.wandb_mode = "offline"; print(wandb_note, flush=True)
-    rank, world, device = initialize(p.seed)
+    if args.npu:
+        if (config.method != "dense_full" or config.scale != "debug" or config.width > 128 or
+                config.layers > 4 or config.sequence_len > 128 or config.vocab_size > 1024):
+            raise ValueError("--npu requires a small debug dense_full configuration")
+        if COMPUTE_DTYPE != torch.float32 or not torch._dynamo.config.disable:
+            raise ValueError("--npu requires NANOCHAT_DTYPE=float32 and TORCH_COMPILE_DISABLE=1 before launch")
+        rank, world, device = initialize(p.seed, npu=True)
+    else:
+        rank, world, device = initialize(p.seed)
     stream_rank, stream_world, shares = data_layout(rank, world)
     if smoke and args.smoke_accumulation: accumulation = args.smoke_accumulation
     elif stream_world == p.data_parallel_size or not smoke:
@@ -344,7 +360,9 @@ def main(argv=None):
         if speedups.active("data") and shares == 1:  # shared streams also skip rows on the CPU
             from nexttransformer.runtime.speedups.prefetch import PrefetchedStream
             stream = PrefetchedStream(stream)
-    model = build_model(config, device, seed=p.seed)
+    # Match the validated backend initialization path; no device fallback for training.
+    model = (build_model(config, "cpu", seed=p.seed).to(device) if args.npu else
+             build_model(config, device, seed=p.seed))
     model.set_sparse_backend(args.sparse_backend)
     # The trainable set (Ouro's gate-only stage) fixes the optimizer groups and DDP reducer.
     start_step = json.loads((resume/"complete.json").read_text())["step"] if resume is not None else 0
@@ -357,6 +375,11 @@ def main(argv=None):
     wrapped = wrap()
     optimizer = build_optimizer(model, train_config)
     software = software_identity(config, args.sparse_backend)
+    if args.npu:
+        software.update(device_backend="npu", torch_npu=importlib.metadata.version("torch-npu"),
+                        cann=getattr(torch.npu, "get_cann_version", lambda: None)(),
+                        npu_name=torch.npu.get_device_name(device),
+                        compute_dtype=str(COMPUTE_DTYPE), optimizer_mode="eager")
     if args.speedups: software.update(speedups=args.speedups)
     state = dict(step=0, input_tokens=0, next_global_sequence=0, data_manifest_sha256=manifest_hash,
                  budget=BudgetState().state_dict(), theory_flops=0, training_seconds=0., evaluation_seconds=0.,
@@ -505,7 +528,9 @@ def main(argv=None):
             if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
             lr = set_schedule(optimizer, step, train_config)
-            totals = torch.zeros(3, device=device, dtype=torch.float64)
+            # Keep exact token accounting and FP64 metrics on the host for NPU smoke.
+            metrics_device = torch.device("cpu") if args.npu else device
+            totals = torch.zeros(3, device=metrics_device, dtype=torch.float64)
             batches = share_batches(stream, args.micro_batch, stream_rows, rank % shares, shares, device)
             for micro in range(accumulation):
                 t = time.perf_counter(); x, y = next(batches); data_seconds += time.perf_counter()-t
@@ -516,8 +541,13 @@ def main(argv=None):
                 # Dense delegates to the native forward and leaves these unset.
                 lm = model.last_lm_loss if model.last_lm_loss is not None else loss
                 aux = model.last_aux_loss if model.last_aux_loss is not None else torch.zeros((), device=device)
-                totals += torch.stack((lm.detach().double()/(accumulation*world), aux.detach().double()/(accumulation*world),
-                                       x.new_full((), x.numel(), dtype=torch.float64)))  # filled on the device: a copy from the host would drain the queue
+                if args.npu:
+                    totals[0] += lm.detach().cpu().double() / accumulation
+                    totals[1] += aux.detach().cpu().double() / accumulation
+                    totals[2] += x.numel()
+                else:
+                    totals += torch.stack((lm.detach().double()/(accumulation*world), aux.detach().double()/(accumulation*world),
+                                           x.new_full((), x.numel(), dtype=torch.float64)))
             # The rows of this stream that the other share keeps; afterwards every copy has the 8-rank state.
             t = time.perf_counter()
             if next(batches, None) is not None: raise RuntimeError("micro batches do not cover the stream's rows")
@@ -549,8 +579,8 @@ def main(argv=None):
                            peak_memory_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0))
             scheduled_evaluations(step+1)
             protocol = (step+1) % train_config.checkpoint_every == 0 or step+1 == stop
-            segment_end = bool(args.max_wall_hours) and (time.monotonic()-started)/3600 >= args.max_wall_hours \
-                and step+1 < stop
+            segment_end = step+1 < stop and (step+1 == args.smoke_stop_at or
+                (bool(args.max_wall_hours) and (time.monotonic()-started)/3600 >= args.max_wall_hours))
             if protocol or (step+1) % args.rolling_every == 0 or segment_end: checkpoint()
             if segment_end: break
 

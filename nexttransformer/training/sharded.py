@@ -6,7 +6,24 @@ import torch.distributed as dist
 from nanochat.optim import MuonAdamW
 
 class ExperimentOptimizer(MuonAdamW):
+    def __init__(self, groups):
+        super().__init__(groups)
+        devices = {p.device for group in self.param_groups for p in group['params']}
+        npu_devices = {device for device in devices if device.type == 'npu'}
+        self._npu_eager = bool(npu_devices)
+        if self._npu_eager:
+            if len(devices) != 1 or dist.is_initialized() or not torch._dynamo.config.disable:
+                raise RuntimeError('NPU optimizer requires eager mode and one device without a process group')
+            device = next(iter(npu_devices))
+            for name in ('_adamw_step_t', '_adamw_lr_t', '_adamw_beta1_t', '_adamw_beta2_t',
+                         '_adamw_eps_t', '_adamw_wd_t', '_muon_momentum_t', '_muon_lr_t',
+                         '_muon_wd_t', '_muon_beta2_t'):
+                setattr(self, name, getattr(self, name).to(device))
+
     def step(self):
+        if self._npu_eager:
+            # NPU eager uses the same update functions without Inductor tuning.
+            return super().step()
         # The extra conditioner/halter AdamW tensors add a finite set of shapes
         # to upstream's shape-specialized fused kernel. Its default limit of 8
         # is too small for LoopFormer. Scope the higher cap to optimizer.step;

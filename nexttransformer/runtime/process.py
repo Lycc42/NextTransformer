@@ -13,11 +13,21 @@ import torch.distributed as dist
 from nexttransformer.runtime.files import sha256
 
 
-def initialize(seed):
+def initialize(seed, *, npu=False):
     world = int(os.environ.get('WORLD_SIZE','1'))
     rank = int(os.environ.get('RANK','0'))
     local_rank = int(os.environ.get('LOCAL_RANK','0'))
-    device = torch.device('cuda',local_rank) if torch.cuda.is_available() else torch.device('cpu')
+    if npu:
+        if (rank, world, local_rank) != (0, 1, 0) or dist.is_initialized():
+            raise RuntimeError('NPU research smoke requires a single local rank without a process group')
+        import torch_npu  # registers the NPU device with PyTorch
+
+        if not torch.npu.is_available() or torch.npu.device_count() != 1:
+            raise RuntimeError('NPU research smoke requires exactly one visible NPU')
+        device = torch.device('npu:0')
+        torch.npu.set_device(device)
+    else:
+        device = torch.device('cuda',local_rank) if torch.cuda.is_available() else torch.device('cpu')
     if device.type=='cuda':
         torch.cuda.set_device(device)
         torch.backends.cuda.matmul.allow_tf32=True
@@ -26,6 +36,7 @@ def initialize(seed):
         dist.init_process_group('nccl' if device.type=='cuda' else 'gloo')
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if device.type=='cuda': torch.cuda.manual_seed_all(seed)
+    if device.type=='npu': torch.npu.manual_seed(seed)
     return rank,world,device
 
 
@@ -35,6 +46,7 @@ def autocast(device):
 
 def synchronize(device):
     if device.type=='cuda': torch.cuda.synchronize(device)
+    if device.type=='npu': torch.npu.synchronize(device)
 
 
 def reduce_sum(tensor):
