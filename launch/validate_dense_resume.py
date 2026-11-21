@@ -2,8 +2,9 @@
 
 Run from the repository root: python -m launch.validate_dense_resume --device cpu
 On an admitted single NPU, use --device npu:0 in the prepared environment.
-The deterministic token stream does not consume NPU RNG. The separate RNG
-checks report TorchNPU API replay and native checkpoint coverage independently.
+The default token stream does not consume NPU RNG. With --npu-rng-sidecar,
+updates consume NPU RNG and the probe explicitly restores a separate sidecar.
+This is not native checkpoint RNG support; the native check still runs first.
 """
 
 import argparse
@@ -43,7 +44,12 @@ def worker(args):
 
         def batch(self):
             self.rows += 1
-            return torch.randint(config.vocab_size, (1, config.sequence_len + 1), generator=self.generator)
+            tokens = torch.randint(config.vocab_size, (1, config.sequence_len + 1), generator=self.generator)
+            if args.npu_rng_sidecar:
+                # Consume the device default generator in every training update.
+                shift = torch.randint(config.vocab_size, (), device=device).item()
+                tokens = (tokens + shift) % config.vocab_size
+            return tokens
 
         def state_dict(self):
             return {"rows": self.rows, "generator": self.generator.get_state()}
@@ -60,9 +66,13 @@ def worker(args):
 
     def preview_tokens():
         state = stream.state_dict()
-        tokens = stream.batch().tolist()
-        stream.load_state_dict(state)
-        return tokens
+        device_state = torch.npu.get_rng_state(device) if args.npu_rng_sidecar else None
+        try:
+            return stream.batch().tolist()
+        finally:
+            stream.load_state_dict(state)
+            if device_state is not None:
+                torch.npu.set_rng_state(device_state, device)
 
     def checkpoint(step):
         state = {"step": step, "input_tokens": stream.rows * config.sequence_len, "next_global_sequence": stream.rows}
@@ -73,7 +83,8 @@ def worker(args):
     np.random.seed(42)
     if device.type == "npu":
         torch.npu.manual_seed(42)
-    report = {"pid": os.getpid(), "updates": [], "npu_rng_api_replay": None, "native_checkpoint_npu_rng_replay": None}
+    report = {"pid": os.getpid(), "updates": [], "npu_rng_api_replay": None,
+              "native_checkpoint_npu_rng_replay": None, "sidecar_npu_rng_replay": None}
     if args.phase != "resume":
         report["updates"] += train_updates(torch, device, components, stream.batch, 0, 2)
         if device.type == "npu":
@@ -90,6 +101,9 @@ def worker(args):
             report["npu_rng_api_replay"] = bool(torch.equal(expected, sample_npu()))
             require(report["npu_rng_api_replay"], "TorchNPU RNG API replay failed")
             torch.save(expected, args.output / "expected-npu-draw.pt")
+            if args.npu_rng_sidecar:
+                torch.save(saved_rng, args.output / "probe-npu-rng-step2.pt")
+                torch.npu.set_rng_state(saved_rng, device)
     else:
         require(args.output.joinpath("checkpoint_00000002/complete.json").is_file(), "missing committed step 2")
         boundary = args.output / "checkpoint_00000002"
@@ -98,11 +112,17 @@ def worker(args):
             torch.npu.manual_seed(1234)
         saved = load_checkpoint(boundary, model, optimizer, stream, rank=0, world=1)
         require(saved["state"]["step"] == stream.rows == 2, "step-2 cursor mismatch")
-        report["next_tokens"] = preview_tokens()
         report["host_rng"] = sample_host()
         if device.type == "npu":
             expected = torch.load(args.output / "expected-npu-draw.pt", map_location="cpu", weights_only=True)
             report["native_checkpoint_npu_rng_replay"] = bool(torch.equal(expected, sample_npu()))
+            if args.npu_rng_sidecar:
+                saved_rng = torch.load(args.output / "probe-npu-rng-step2.pt", map_location="cpu", weights_only=True)
+                torch.npu.set_rng_state(saved_rng, device)
+                report["sidecar_npu_rng_replay"] = bool(torch.equal(expected, sample_npu()))
+                require(report["sidecar_npu_rng_replay"], "RNG sidecar replay failed")
+                torch.npu.set_rng_state(saved_rng, device)
+        report["next_tokens"] = preview_tokens()
     if args.phase != "first":
         report["updates"] += train_updates(torch, device, components, stream.batch, 2, 4)
         checkpoint(4)
@@ -130,7 +150,7 @@ def compare(a, b, torch, path, errors):
         require(a == b, f"value mismatch: {path}")
 
 
-def orchestrate(device, root):
+def orchestrate(device, root, npu_rng_sidecar):
     import torch
 
     continuous, segmented = root / "continuous", root / "segmented"
@@ -138,8 +158,11 @@ def orchestrate(device, root):
         directory.mkdir()
 
     def run(phase, directory):
-        subprocess.run([sys.executable, "-m", "launch.validate_dense_resume", "--device", device,
-                        "--phase", phase, "--output", str(directory)], check=True)
+        command = [sys.executable, "-m", "launch.validate_dense_resume", "--device", device,
+                   "--phase", phase, "--output", str(directory)]
+        if npu_rng_sidecar:
+            command.append("--npu-rng-sidecar")
+        subprocess.run(command, check=True)
         return json.loads(directory.joinpath(phase + ".json").read_text(encoding="utf-8"))
 
     a, first, resumed = run("continuous", continuous), run("first", segmented), run("resume", segmented)
@@ -163,9 +186,10 @@ def orchestrate(device, root):
             "continuous_steps": [x["step"] for x in a["updates"]], "segmented_steps": [x["step"] for x in b],
             "continuous_losses": losses_a, "segmented_losses": losses_b,
             "max_abs_checkpoint_tensor_error": max(errors, default=0), "cursor_and_next_tokens_match": True,
-            "host_rng_replay": True, "npu_rng_consumed_by_training": False,
+            "host_rng_replay": True, "npu_rng_consumed_by_training": npu_rng_sidecar,
             "npu_rng_api_replay": first["npu_rng_api_replay"],
-            "native_checkpoint_npu_rng_replay": resumed["native_checkpoint_npu_rng_replay"]}
+            "native_checkpoint_npu_rng_replay": resumed["native_checkpoint_npu_rng_replay"],
+            "sidecar_npu_rng_replay": resumed["sidecar_npu_rng_replay"]}
 
 
 def main():
@@ -173,17 +197,20 @@ def main():
     parser.add_argument("--device", choices=("cpu", "npu:0"), required=True)
     parser.add_argument("--phase", choices=("continuous", "first", "resume"), help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, help="new directory to retain trusted local checkpoint artifacts")
+    parser.add_argument("--npu-rng-sidecar", action="store_true", help="test NPU-random training with a separate RNG file")
     args = parser.parse_args()
+    if args.npu_rng_sidecar and args.device != "npu:0":
+        parser.error("--npu-rng-sidecar requires --device npu:0")
     os.environ.update(TORCH_COMPILE_DISABLE="1", NANOCHAT_DTYPE="float32")
     if args.phase:
         require(args.output is not None, "worker requires output directory")
         worker(args)
     elif args.output:
         args.output.mkdir(parents=True, exist_ok=False)
-        print(json.dumps(orchestrate(args.device, args.output), indent=2))
+        print(json.dumps(orchestrate(args.device, args.output, args.npu_rng_sidecar), indent=2))
     else:
         with tempfile.TemporaryDirectory(prefix="dense-resume-") as path:
-            print(json.dumps(orchestrate(args.device, Path(path)), indent=2))
+            print(json.dumps(orchestrate(args.device, Path(path), args.npu_rng_sidecar), indent=2))
 
 
 if __name__ == "__main__":
