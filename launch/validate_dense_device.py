@@ -56,11 +56,11 @@ def attention_check(torch, flash_attention, device, rng):
     return result
 
 
-def train_check(torch, device, rng, steps, skip_inductor_tuning=False):
+def build_probe_training(torch, device, skip_inductor_tuning=False):
     from nexttransformer.models import build_model
     from nexttransformer.models.config import debug_config
     from nexttransformer.models.native.config import NativeTrainConfig
-    from nexttransformer.training.optimizer import build_optimizer, set_schedule
+    from nexttransformer.training.optimizer import build_optimizer
 
     config = debug_config("dense_full")
     train = NativeTrainConfig()
@@ -93,11 +93,18 @@ def train_check(torch, device, rng, steps, skip_inductor_tuning=False):
     else:
         optimizer = build_optimizer(model, train)
     require({g["kind"] for g in optimizer.param_groups} == {"adamw", "muon"}, "missing optimizer kind")
+    return config, train, model, optimizer
+
+
+def train_updates(torch, device, components, next_tokens, start, stop):
+    from nexttransformer.training.optimizer import set_schedule
+
+    _, train, model, optimizer = components
     records = []
-    for step in range(steps):
+    for step in range(start, stop):
         model.set_step(step)
         model.set_row_offset(step)
-        tokens = torch.randint(config.vocab_size, (1, config.sequence_len + 1), generator=rng).to(device)
+        tokens = next_tokens().to(device)
         optimizer.zero_grad(set_to_none=True)
         set_schedule(optimizer, step, train)
         loss = model(tokens[:, :-1], tokens[:, 1:])
@@ -152,6 +159,17 @@ def train_check(torch, device, rng, steps, skip_inductor_tuning=False):
         for kind, item in summary.items():
             require(item["updated"] and all(item["changed_state"].values()), f"{kind} did not update at step {step + 1}")
         records.append({"step": step + 1, "loss": loss.item(), "loss_dtype": str(loss.dtype), "groups": summary})
+    return records
+
+
+def train_check(torch, device, rng, steps, skip_inductor_tuning=False):
+    components = build_probe_training(torch, device, skip_inductor_tuning)
+    config = components[0]
+
+    def next_tokens():
+        return torch.randint(config.vocab_size, (1, config.sequence_len + 1), generator=rng)
+
+    records = train_updates(torch, device, components, next_tokens, 0, steps)
     return {"shape": {key: getattr(config, key) for key in ("width", "heads", "layers", "sequence_len", "vocab_size")},
             "updates": records}
 
