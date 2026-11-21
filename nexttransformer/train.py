@@ -276,9 +276,8 @@ def parse(argv=None):
     if args.smoke_accumulation and not args.smoke_steps: parser.error("--smoke-accumulation is smoke-only")
     if args.smoke_stop_at and not 0 < args.smoke_stop_at < args.smoke_steps:
         parser.error("--smoke-stop-at must be positive and below --smoke-steps")
-    if args.npu and (args.formal or args.smoke_steps <= 0 or args.speedups or args.deterministic_attention or
-                     args.smoke_core_per_task):
-        parser.error("--npu requires research smoke without speedups, CORE, or CUDA deterministic-attention options")
+    if args.npu and (args.formal or args.smoke_steps <= 0 or args.speedups or args.smoke_core_per_task):
+        parser.error("--npu requires research smoke without speedups or CORE")
     return args
 
 
@@ -287,7 +286,7 @@ def main(argv=None):
     p, train_config = Protocol(), NativeTrainConfig()
     p.validate_train_config(train_config)
     smoke = args.smoke_steps > 0
-    if args.deterministic_attention:
+    if args.deterministic_attention and not args.npu:
         from nanochat import flash_attention
         if flash_attention.USE_FA3: raise RuntimeError("FA3 backward is not deterministic; run without FA3")
         torch.backends.cuda.enable_flash_sdp(False)
@@ -319,6 +318,8 @@ def main(argv=None):
         if COMPUTE_DTYPE != torch.float32 or not torch._dynamo.config.disable:
             raise ValueError("--npu requires NANOCHAT_DTYPE=float32 and TORCH_COMPILE_DISABLE=1 before launch")
         rank, world, device = initialize(p.seed, npu=True)
+        if args.deterministic_attention:
+            torch.use_deterministic_algorithms(True)
     else:
         rank, world, device = initialize(p.seed)
     stream_rank, stream_world, shares = data_layout(rank, world)
@@ -379,7 +380,8 @@ def main(argv=None):
         software.update(device_backend="npu", torch_npu=importlib.metadata.version("torch-npu"),
                         cann=getattr(torch.npu, "get_cann_version", lambda: None)(),
                         npu_name=torch.npu.get_device_name(device),
-                        compute_dtype=str(COMPUTE_DTYPE), optimizer_mode="eager")
+                        compute_dtype=str(COMPUTE_DTYPE), optimizer_mode="eager",
+                        deterministic_algorithms=torch.are_deterministic_algorithms_enabled())
     if args.speedups: software.update(speedups=args.speedups)
     state = dict(step=0, input_tokens=0, next_global_sequence=0, data_manifest_sha256=manifest_hash,
                  budget=BudgetState().state_dict(), theory_flops=0, training_seconds=0., evaluation_seconds=0.,
