@@ -80,6 +80,16 @@ def train_check(torch, device, rng, steps, skip_inductor_tuning=False):
                 return MuonAdamW.step(self)
 
         optimizer = EagerProbeOptimizer(parameter_groups(model, train))
+        if device.type == "npu":
+            # The eager NPU lerp overload requires its tensor weight on NPU.
+            # Preserve FP32 zero-dimensional scalars and the original kernels.
+            scalar_names = (
+                "_adamw_step_t", "_adamw_lr_t", "_adamw_beta1_t", "_adamw_beta2_t",
+                "_adamw_eps_t", "_adamw_wd_t", "_muon_momentum_t", "_muon_lr_t",
+                "_muon_wd_t", "_muon_beta2_t",
+            )
+            for name in scalar_names:
+                setattr(optimizer, name, getattr(optimizer, name).to(device))
     else:
         optimizer = build_optimizer(model, train)
     require({g["kind"] for g in optimizer.param_groups} == {"adamw", "muon"}, "missing optimizer kind")
@@ -177,7 +187,8 @@ def main():
               "python": platform.python_version(), "platform": platform.system(), "arch": platform.machine(),
               "torch": torch.__version__, "torch_npu": npu_version, "device": str(device), "seed": 42,
               "compute_dtype": str(COMPUTE_DTYPE), "mode": "eager", "torch_compile_disabled": True,
-              "inductor_tuning_skipped": args.skip_inductor_tuning}
+              "inductor_tuning_skipped": args.skip_inductor_tuning,
+              "optimizer_scalar_device": str(device) if args.skip_inductor_tuning else "cpu"}
     phase = "attention"
     try:
         report["attention"] = attention_check(torch, flash_attention, device, torch.Generator().manual_seed(42))
