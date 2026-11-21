@@ -144,7 +144,7 @@ def compare(a, b, torch, path, errors):
     if isinstance(a, torch.Tensor):
         require(isinstance(b, torch.Tensor) and a.shape == b.shape and a.dtype == b.dtype, f"tensor mismatch: {path}")
         if a.is_floating_point() and a.numel():
-            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-7, msg=path)
+            torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-7, msg=lambda message: f"{path}: {message}")
             errors.append((a - b).abs().max().item())
         else:
             require(torch.equal(a, b), f"tensor mismatch: {path}")

@@ -10,13 +10,17 @@ from launch.validate_dense_device import require
 from launch.validate_dense_resume import compare
 
 
-def check(left, right, resources, split_step, total):
+RTOL, ATOL = 1e-5, 1e-7
+
+
+def check(left, right, resources, split_step, total, *, uninterrupted_control=False):
     import torch
 
     from nanochat.tokenizer import RustBPETokenizer
     from nexttransformer.runtime.data import BestFitStream
 
-    require((right / f"resume_{split_step:08d}.json").is_file(), "missing resumed segment provenance")
+    if not uninterrupted_control:
+        require((right / f"resume_{split_step:08d}.json").is_file(), "missing resumed segment provenance")
 
     def updates(root):
         rows = map(json.loads, (root / "metrics.jsonl").read_text().splitlines())
@@ -73,9 +77,11 @@ def check(left, right, resources, split_step, total):
                 require(old["step"] == split_step and new["step"] == total, "AdamW counter mismatch")
     require(set(changes) == {"adamw", "muon"} and all(c["moved"] and all(c["state_changed"].values())
             for c in changes.values()), "missing parameter/state updates")
-    return {"status": "passed", "steps": expected, "split_step": split_step, "losses": [e["loss"] for e in a],
+    return {"status": "passed", "comparison": "uninterrupted_control" if uninterrupted_control else "resume",
+            "steps": expected, "split_step": split_step, "losses": [e["loss"] for e in a],
             "next_packed_batch_sha256": hashlib.sha256(json.dumps(tokens).encode()).hexdigest(),
-            "max_checkpoint_abs_error": max(errors, default=0), "actual_updates": changes}
+            "max_checkpoint_abs_error": max(errors, default=0), "rtol": RTOL, "atol": ATOL,
+            "compared_checkpoint_steps": sorted({split_step, split_step + 1, total}), "actual_updates": changes}
 
 
 def main():
@@ -85,10 +91,12 @@ def main():
     parser.add_argument("--resources", type=Path, required=True)
     parser.add_argument("--split", type=int, default=2)
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--uninterrupted-control", action="store_true", help="compare two uninterrupted runs")
     args = parser.parse_args()
     if not 0 < args.split < args.steps:
         parser.error("split must be between 0 and steps")
-    print(json.dumps(check(args.continuous, args.segmented, args.resources, args.split, args.steps), indent=2))
+    print(json.dumps(check(args.continuous, args.segmented, args.resources, args.split, args.steps,
+                           uninterrupted_control=args.uninterrupted_control), indent=2))
 
 
 if __name__ == "__main__":
