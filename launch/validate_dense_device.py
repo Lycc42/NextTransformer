@@ -56,7 +56,7 @@ def attention_check(torch, flash_attention, device, rng):
     return result
 
 
-def train_check(torch, device, rng, steps):
+def train_check(torch, device, rng, steps, skip_inductor_tuning=False):
     from nexttransformer.models import build_model
     from nexttransformer.models.config import debug_config
     from nexttransformer.models.native.config import NativeTrainConfig
@@ -68,7 +68,20 @@ def train_check(torch, device, rng, steps):
     model = build_model(config, "cpu", seed=42).to(device).train()
     require(all(p.device == device and p.dtype == torch.float32 for p in model.parameters()),
             "model parameters are not all FP32 on the requested device")
-    optimizer = build_optimizer(model, train)
+    if skip_inductor_tuning:
+        from nanochat.optim import MuonAdamW
+        from nexttransformer.training.optimizer import parameter_groups
+        from nexttransformer.training.sharded import ExperimentOptimizer
+
+        class EagerProbeOptimizer(ExperimentOptimizer):
+            # Skip only the compiler configuration context; keep the same
+            # parameter groups, reduction methods, and update kernels.
+            def step(self):
+                return MuonAdamW.step(self)
+
+        optimizer = EagerProbeOptimizer(parameter_groups(model, train))
+    else:
+        optimizer = build_optimizer(model, train)
     require({g["kind"] for g in optimizer.param_groups} == {"adamw", "muon"}, "missing optimizer kind")
     records = []
     for step in range(steps):
@@ -137,6 +150,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "npu:0"), required=True)
     parser.add_argument("--steps", type=int, choices=range(1, 5), default=3)
+    parser.add_argument("--skip-inductor-tuning", action="store_true",
+                        help="probe-only: bypass the compiled optimizer tuning context, not its updates")
     args = parser.parse_args()
     require("torch" not in sys.modules, "run the probe in a fresh Python process")
     os.environ.update(TORCH_COMPILE_DISABLE="1", NANOCHAT_DTYPE="float32")
@@ -161,12 +176,14 @@ def main():
     report = {"scope": "standalone_component_probe", "commit": git.stdout.strip() or None,
               "python": platform.python_version(), "platform": platform.system(), "arch": platform.machine(),
               "torch": torch.__version__, "torch_npu": npu_version, "device": str(device), "seed": 42,
-              "compute_dtype": str(COMPUTE_DTYPE), "mode": "eager", "torch_compile_disabled": True}
+              "compute_dtype": str(COMPUTE_DTYPE), "mode": "eager", "torch_compile_disabled": True,
+              "inductor_tuning_skipped": args.skip_inductor_tuning}
     phase = "attention"
     try:
         report["attention"] = attention_check(torch, flash_attention, device, torch.Generator().manual_seed(42))
         phase = "training"
-        report["training"] = train_check(torch, device, torch.Generator().manual_seed(43), args.steps)
+        report["training"] = train_check(torch, device, torch.Generator().manual_seed(43), args.steps,
+                                         skip_inductor_tuning=args.skip_inductor_tuning)
     except Exception as exc:
         report.update(status="failed", phase=phase, error=f"{type(exc).__name__}: {exc}")
         print(json.dumps(report, indent=2), flush=True)
