@@ -2,9 +2,9 @@
 
 Run from the repository root: python -m launch.validate_dense_resume --device cpu
 On an admitted single NPU, use --device npu:0 in the prepared environment.
-The default token stream does not consume NPU RNG. With --npu-rng-sidecar,
-updates consume NPU RNG and the probe explicitly restores a separate sidecar.
-This is not native checkpoint RNG support; the native check still runs first.
+The default token stream does not consume NPU RNG. Use --require-native-npu-rng
+for NPU-random updates with native restoration. The historical sidecar mode is
+an independent comparison, not the trainer checkpoint format.
 """
 
 import argparse
@@ -34,6 +34,7 @@ def worker(args):
     require(torch._dynamo.config.disable, "TorchDynamo must be disabled")
     torch.set_num_threads(1)
     device = torch.device(args.device)
+    consumes_npu_rng = args.npu_rng_sidecar or args.require_native_npu_rng
     components = build_probe_training(torch, device, skip_inductor_tuning=device.type == "npu")
     config, train, model, optimizer = components
 
@@ -45,7 +46,7 @@ def worker(args):
         def batch(self):
             self.rows += 1
             tokens = torch.randint(config.vocab_size, (1, config.sequence_len + 1), generator=self.generator)
-            if args.npu_rng_sidecar:
+            if consumes_npu_rng:
                 # Consume the device default generator in every training update.
                 shift = torch.randint(config.vocab_size, (), device=device).item()
                 tokens = (tokens + shift) % config.vocab_size
@@ -66,7 +67,7 @@ def worker(args):
 
     def preview_tokens():
         state = stream.state_dict()
-        device_state = torch.npu.get_rng_state(device) if args.npu_rng_sidecar else None
+        device_state = torch.npu.get_rng_state(device) if consumes_npu_rng else None
         try:
             return stream.batch().tolist()
         finally:
@@ -103,6 +104,7 @@ def worker(args):
             torch.save(expected, args.output / "expected-npu-draw.pt")
             if args.npu_rng_sidecar:
                 torch.save(saved_rng, args.output / "probe-npu-rng-step2.pt")
+            if consumes_npu_rng:
                 torch.npu.set_rng_state(saved_rng, device)
     else:
         require(args.output.joinpath("checkpoint_00000002/complete.json").is_file(), "missing committed step 2")
@@ -115,7 +117,15 @@ def worker(args):
         report["host_rng"] = sample_host()
         if device.type == "npu":
             expected = torch.load(args.output / "expected-npu-draw.pt", map_location="cpu", weights_only=True)
-            report["native_checkpoint_npu_rng_replay"] = bool(torch.equal(expected, sample_npu()))
+            loaded_rng = torch.npu.get_rng_state(device)
+            actual = sample_npu()
+            report["native_checkpoint_npu_rng_replay"] = bool(torch.equal(expected, actual))
+            if args.require_native_npu_rng:
+                torch.npu.manual_seed(1234)
+                report["omitted_npu_rng_restore_detected"] = not torch.equal(expected, sample_npu())
+                require(report["omitted_npu_rng_restore_detected"], "negative RNG control unexpectedly matched")
+                require(report["native_checkpoint_npu_rng_replay"], "native NPU RNG restore did not replay the next draw")
+                torch.npu.set_rng_state(loaded_rng, device)
             if args.npu_rng_sidecar:
                 saved_rng = torch.load(args.output / "probe-npu-rng-step2.pt", map_location="cpu", weights_only=True)
                 torch.npu.set_rng_state(saved_rng, device)
@@ -150,7 +160,7 @@ def compare(a, b, torch, path, errors):
         require(a == b, f"value mismatch: {path}")
 
 
-def orchestrate(device, root, npu_rng_sidecar):
+def orchestrate(device, root, npu_rng_sidecar, require_native_npu_rng):
     import torch
 
     continuous, segmented = root / "continuous", root / "segmented"
@@ -162,6 +172,8 @@ def orchestrate(device, root, npu_rng_sidecar):
                    "--phase", phase, "--output", str(directory)]
         if npu_rng_sidecar:
             command.append("--npu-rng-sidecar")
+        if require_native_npu_rng:
+            command.append("--require-native-npu-rng")
         subprocess.run(command, check=True)
         return json.loads(directory.joinpath(phase + ".json").read_text(encoding="utf-8"))
 
@@ -186,7 +198,8 @@ def orchestrate(device, root, npu_rng_sidecar):
             "continuous_steps": [x["step"] for x in a["updates"]], "segmented_steps": [x["step"] for x in b],
             "continuous_losses": losses_a, "segmented_losses": losses_b,
             "max_abs_checkpoint_tensor_error": max(errors, default=0), "cursor_and_next_tokens_match": True,
-            "host_rng_replay": True, "npu_rng_consumed_by_training": npu_rng_sidecar,
+            "host_rng_replay": True, "npu_rng_consumed_by_training": npu_rng_sidecar or require_native_npu_rng,
+            "omitted_npu_rng_restore_detected": resumed.get("omitted_npu_rng_restore_detected"),
             "npu_rng_api_replay": first["npu_rng_api_replay"],
             "native_checkpoint_npu_rng_replay": resumed["native_checkpoint_npu_rng_replay"],
             "sidecar_npu_rng_replay": resumed["sidecar_npu_rng_replay"]}
@@ -197,20 +210,22 @@ def main():
     parser.add_argument("--device", choices=("cpu", "npu:0"), required=True)
     parser.add_argument("--phase", choices=("continuous", "first", "resume"), help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, help="new directory to retain trusted local checkpoint artifacts")
-    parser.add_argument("--npu-rng-sidecar", action="store_true", help="test NPU-random training with a separate RNG file")
+    rng_mode = parser.add_mutually_exclusive_group()
+    rng_mode.add_argument("--npu-rng-sidecar", action="store_true", help="test NPU-random training with a separate RNG file")
+    rng_mode.add_argument("--require-native-npu-rng", action="store_true", help="require native replay for NPU-random training")
     args = parser.parse_args()
-    if args.npu_rng_sidecar and args.device != "npu:0":
-        parser.error("--npu-rng-sidecar requires --device npu:0")
+    if (args.npu_rng_sidecar or args.require_native_npu_rng) and args.device != "npu:0":
+        parser.error(f"{'--npu-rng-sidecar' if args.npu_rng_sidecar else '--require-native-npu-rng'} requires --device npu:0")
     os.environ.update(TORCH_COMPILE_DISABLE="1", NANOCHAT_DTYPE="float32")
     if args.phase:
         require(args.output is not None, "worker requires output directory")
         worker(args)
     elif args.output:
         args.output.mkdir(parents=True, exist_ok=False)
-        print(json.dumps(orchestrate(args.device, args.output, args.npu_rng_sidecar), indent=2))
+        print(json.dumps(orchestrate(args.device, args.output, args.npu_rng_sidecar, args.require_native_npu_rng), indent=2))
     else:
         with tempfile.TemporaryDirectory(prefix="dense-resume-") as path:
-            print(json.dumps(orchestrate(args.device, Path(path), args.npu_rng_sidecar), indent=2))
+            print(json.dumps(orchestrate(args.device, Path(path), args.npu_rng_sidecar, args.require_native_npu_rng), indent=2))
 
 
 if __name__ == "__main__":
